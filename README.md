@@ -1,6 +1,6 @@
 # DynamoDB Garbage Collector
 
-[![Version](https://img.shields.io/badge/version-0.0.0-blue.svg)](https://shields.io/)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://shields.io/)
 
 The DynamoDB Garbage Collector is a Python library that allows you to delete garbage items in DynamoDB tables.
 

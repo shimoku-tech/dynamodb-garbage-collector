@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dynamodb-garbage-collector"
-version = "0.0.0"
+version = "1.0.0"
 description = "Remove garbage items from DynamoDB tables"
 authors = ["Marçal Pla <marcal.pla@shimoku.com>"]
 license = "MIT License"
