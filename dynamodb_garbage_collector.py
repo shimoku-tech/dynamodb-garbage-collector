@@ -1,12 +1,48 @@
 import boto3
 import botocore
 import datetime
-from concurrent.futures import ThreadPoolExecutor
+import time
+from typing import List, Dict, Any, Type
+from concurrent.futures import ThreadPoolExecutor, Future
 from threading import Lock
+from logging import Logger
 
-def purge_orphan_items(logger, region, parent_table, child_table, key_attribute, 
-                       child_reference_attribute, max_workers=100, 
-                       timestamp_attribute=None, timestamp_format=None):
+def _delete_items(client: Type[boto3.client], table: str, 
+                  items: List[Dict[str, Any]]) -> int:
+    # Create a list of delete requests for each item
+    unprocessed_items = [{'DeleteRequest':{'Key': item}} for item in items]
+
+    # Backoff time for retrying requests that fail due to exceeded throughput
+    backoff = 1
+
+    while unprocessed_items: 
+        response = None
+        try:
+            # Perform the batch write request
+            response = client.batch_write_item(
+                RequestItems={
+                    table: unprocessed_items
+                })
+        except client.exceptions.ProvisionedThroughputExceededException:
+            # If the request fails due to exceeded throughput, sleep and
+            # retry with an increased backoff time            
+            time.sleep(backoff)
+            backoff *= 2
+        else:
+            # Reset the backoff time if the request succeeded
+            backoff = 1
+
+        # Check if there are any unprocessed items and retry them in the 
+        # next iteration if there are
+        if response:
+            unprocessed_items = response.get('UnprocessedItems', {}).get(table, [])
+
+    return len(items)
+
+def purge_orphan_items(logger: Logger, region: str, parent_table: str, child_table: str, 
+                       key_attribute: str, child_reference_attribute: str, 
+                       max_workers: int = 100, timestamp_attribute: str = None, 
+                       timestamp_format: str = None) -> None:
     logger.info(f'Purge of orphaned items in {child_table} referencing a '
                 f'non-existent item in {parent_table} started')
     
@@ -16,6 +52,37 @@ def purge_orphan_items(logger, region, parent_table, child_table, key_attribute,
         "dynamodb", 
         region_name=region, 
         config=botocore.config.Config(max_pool_connections=max_workers+10))
+
+    # Initialize variables used to track deleted items and execute deletion operations 
+    # concurrently
+    deleted_items_counter = 0
+    last_logged_counter = 0
+    lock = Lock()  
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    # Closure of purge_orphan_items used to submit a delete items operation
+    def submit_delete_items(table: str, items: List):        
+        # Callback called when a delete items operation completes 
+        # Lock used to ensure variables deleted_items_counter and last_logged_counter 
+        # of purge_orphan_items are updated atomically        
+        def delete_items_callback(future: Future):
+            nonlocal deleted_items_counter
+            nonlocal last_logged_counter
+            with lock:
+                deleted_items_counter += future.result()
+                if deleted_items_counter - last_logged_counter >= 100:
+                    logger.info(f'Total deleted items in {table}: {deleted_items_counter}')
+                    last_logged_counter = deleted_items_counter
+                    
+        # Wait until the size of the work queue of the executor is less than 10
+        while executor._work_queue.qsize() >= 10:
+            pass
+        future = executor.submit(
+            _delete_items, 
+            client=client,
+            table=table,
+            items=items)
+        future.add_done_callback(delete_items_callback)    
 
     # Query the parent table to get all parent ids
     parent_table_ids = []
@@ -49,20 +116,6 @@ def purge_orphan_items(logger, region, parent_table, child_table, key_attribute,
 
     logger.info(f'Total scanned items in {parent_table}: {scanned_parent_items}')
 
-    # Function called when a delete item operation completes 
-    # Lock used to ensure deleted_items_counter is updated atomically
-    deleted_items_counter = 0
-    lock = Lock()
-    def delete_item_callback(future):
-        nonlocal deleted_items_counter
-        with lock:
-            deleted_items_counter += 1
-            if deleted_items_counter % 100 == 0:
-                logger.info(f'Total deleted items in {child_table}: {deleted_items_counter}')
-
-    # Initialize a ThreadPoolExecutor with max workers    
-    executor = ThreadPoolExecutor(max_workers=max_workers)    
-
     # Set the maximum timestamp for the records to delete (e.g., one hour ago)
     # This will be used only if the timestamp condition should be applied
     max_timestamp = datetime.datetime.utcnow() - datetime.timedelta(hours=1)                
@@ -85,6 +138,7 @@ def purge_orphan_items(logger, region, parent_table, child_table, key_attribute,
         ExpressionAttributeNames=expression_attribute_names
     )
     scanned_child_items = 0
+    unprocessed_orphan_items = []
     while 'LastEvaluatedKey' in response:
         for item in response['Items']:
             scanned_child_items += 1
@@ -98,17 +152,11 @@ def purge_orphan_items(logger, region, parent_table, child_table, key_attribute,
                     continue
 
             if item[child_reference_attribute]['S'] not in parent_table_ids:
-                # Wait until the size of the work queue of the executor is less than 10
-                while executor._work_queue.qsize() >= 10: 
-                    pass
-
-                # Submit the delete_item operation to the executor as a task to be 
-                # executed in a separate thread
-                future = executor.submit(
-                    client.delete_item, 
-                    TableName=child_table, 
-                    Key={key_attribute: item[key_attribute]})
-                future.add_done_callback(delete_item_callback)               
+                unprocessed_orphan_items.append({key_attribute: item[key_attribute]})
+                # Begins delete operation when accumulated items in unprocessed_orphan_items reaches 25
+                if len(unprocessed_orphan_items) == 25:
+                    submit_delete_items(child_table, unprocessed_orphan_items)
+                    unprocessed_orphan_items = []            
 
         response = client.scan(
             TableName=child_table,
@@ -127,17 +175,16 @@ def purge_orphan_items(logger, region, parent_table, child_table, key_attribute,
                 continue
 
         if item[child_reference_attribute]['S'] not in parent_table_ids:
-            # Wait until the size of the work queue of the executor is less than 10
-            while executor._work_queue.qsize() >= 10: 
-                pass
+            unprocessed_orphan_items.append({key_attribute: item[key_attribute]})
+            # Begins delete operation when accumulated items in unprocessed_orphan_items reaches 25
+            if len(unprocessed_orphan_items) == 25:
+                submit_delete_items(child_table, unprocessed_orphan_items)
+                unprocessed_orphan_items = []   
 
-            # Submit the delete_item operation to the executor as a task to be 
-            # executed in a separate thread
-            future = executor.submit(
-                client.delete_item, 
-                TableName=child_table, 
-                Key={key_attribute: item[key_attribute]})
-            future.add_done_callback(delete_item_callback)
+    # If there are remaining items in unprocessed_orphan_items proceed with delete operation
+    if len(unprocessed_orphan_items) > 0:
+        submit_delete_items(child_table, unprocessed_orphan_items)
+        unprocessed_orphan_items = []
 
     logger.info(f'Total scanned items in {child_table}: {scanned_child_items}')         
 
