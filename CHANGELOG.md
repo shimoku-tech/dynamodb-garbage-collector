@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 1.1.0 (2023-01-02)
+
+### Improved performance of `purge_orphan_items` function by implementing batch item deletions
+
+* Replaced usage of Boto3 DynamoDB client `delete_item` with `batch_write_item` for deleting items in DynamoDB. This change improves performance by reducing the number of requests made to DynamoDB and allowing for batch deletions.
+* Added internal `_delete_items` function to handle the `batch_write_item` operation.  
+* Added closure `submit_delete_items` to the `purge_orphan_items` function, which contains the `executor.submit` call to `_delete_items` and the `delete_items_callback` function.
+
 ## 1.0.0 (2023-01-01)
 
 ### Initial release with `purge_orphan_items` function
